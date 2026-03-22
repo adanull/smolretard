@@ -1,0 +1,6 @@
+.env
+risk_state.json
+trades.log
+__pycache__/
+*.pyc
+.venv/
