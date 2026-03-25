@@ -25,12 +25,15 @@ import config
 from lnm_client import LNMClientWrapper
 from strategy import analyze_funding, decide_action, calculate_stop_take
 from risk_manager import RiskManager
+from grid_strategy import GridState, sync_grid, calculate_grid_levels
 from notifications import (
     notify_trade_opened,
     notify_trade_closed,
     notify_status,
     notify_error,
     notify_kill_switch,
+    notify_grid_order_placed,
+    notify_grid_recentered,
 )
 
 # === Logging Setup ===
@@ -53,48 +56,54 @@ async def run_cycle(client: LNMClientWrapper, risk: RiskManager) -> str:
         Summary string of what happened.
     """
     risk.check_new_day()
+    summary = ""
 
-    # 1. Get funding data
-    logger.info("Fetching funding settlements...")
-    settlements = await client.get_funding_settlements(limit=config.FUNDING_LOOKBACK)
+    # Funding strategy
+    if config.FUNDING_ENABLED:
+        logger.info("Fetching funding settlements...")
+        settlements = await client.get_funding_settlements(limit=config.FUNDING_LOOKBACK)
 
-    if not settlements:
-        return "No funding data available"
-
-    # 2. Analyze
-    analysis = analyze_funding(settlements)
-
-    # 3. Get current positions
-    positions = []
-    try:
-        positions = await client.get_running_trades()
-    except Exception as e:
-        logger.warning("Could not fetch positions: %s", e)
-
-    # 4. Decide
-    signal = decide_action(analysis, positions, risk.daily_pnl_sats)
-    logger.info("Decision: %s — %s (confidence: %.0f%%)", signal.action, signal.reason, signal.confidence * 100)
-
-    # 5. Execute
-    if signal.action == "hold":
-        summary = f"HOLD: {signal.reason}"
-
-    elif signal.action in ("open_long", "open_short"):
-        can, reason = risk.can_trade()
-        if not can:
-            summary = f"BLOCKED: {reason}"
-            logger.warning(summary)
+        if not settlements:
+            summary = "No funding data available"
         else:
-            side = "buy" if signal.action == "open_long" else "sell"
-            summary = await _execute_open(client, risk, side, signal)
+            analysis = analyze_funding(settlements)
 
-    elif signal.action == "close":
-        summary = await _execute_close(client, risk, positions, signal)
+            positions = []
+            try:
+                positions = await client.get_running_trades()
+            except Exception as e:
+                logger.warning("Could not fetch positions: %s", e)
 
+            signal = decide_action(analysis, positions, risk.strategy_pnl.get("funding", 0))
+            logger.info("Decision: %s — %s (confidence: %.0f%%)", signal.action, signal.reason, signal.confidence * 100)
+
+            if signal.action == "hold":
+                summary = f"HOLD: {signal.reason}"
+            elif signal.action in ("open_long", "open_short"):
+                can, reason = risk.can_trade("funding")
+                if not can:
+                    summary = f"BLOCKED: {reason}"
+                    logger.warning(summary)
+                else:
+                    side = "buy" if signal.action == "open_long" else "sell"
+                    summary = await _execute_open(client, risk, side, signal)
+            elif signal.action == "close":
+                summary = await _execute_close(client, risk, positions, signal)
+            else:
+                summary = f"Unknown action: {signal.action}"
     else:
-        summary = f"Unknown action: {signal.action}"
+        summary = "FUNDING: disabled"
 
-    # 6. Status report
+    # Grid strategy
+    if config.GRID_ENABLED:
+        try:
+            grid_summary = await run_grid_cycle(client, risk)
+            summary += f" | GRID: {grid_summary}"
+        except Exception as e:
+            notify_error(f"Grid cycle error: {e}")
+            summary += f" | GRID ERROR: {e}"
+
+    # 7. Status report
     risk_status = risk.status()
     notify_status(risk_status, summary)
 
@@ -189,6 +198,116 @@ async def _execute_close(
     return "No positions needed closing"
 
 
+async def run_grid_cycle(client: LNMClientWrapper, risk: RiskManager) -> str:
+    """
+    Execute one grid trading cycle.
+
+    Returns:
+        Summary string.
+    """
+    can, reason = risk.can_trade("grid")
+    if not can:
+        return f"BLOCKED: {reason}"
+
+    # Get current price
+    price = await client.get_last_price()
+
+    # Get open limit orders and running trades
+    open_orders = await client.get_open_orders()
+    running_trades = await client.get_running_trades()
+
+    # Load grid state and sync
+    state = GridState.load()
+    actions = sync_grid(price, open_orders, running_trades, state)
+
+    if not actions:
+        return f"Grid OK — {len(open_orders)} orders active, center: {state.center_price:.2f}"
+
+    placed = 0
+    for action in actions:
+        if action.action == "recenter":
+            # Cancel all existing grid orders and rebuild
+            if config.BOT_MODE == "dry":
+                logger.info("🏜️ DRY RUN — would recenter grid to %.2f", action.price)
+                notify_grid_recentered(state.center_price, action.price)
+                state.center_price = action.price
+                state.save()
+                # Re-sync to get the new placement actions
+                new_actions = sync_grid(action.price, [], running_trades, state)
+                for a in new_actions:
+                    if a.action == "place":
+                        logger.info("🏜️ DRY RUN — would place %s limit @ %.2f", a.side, a.price)
+                        placed += 1
+            else:
+                old_center = state.center_price
+                await client.cancel_all_orders()
+                state.center_price = action.price
+                state.levels = []
+                state.save()
+                notify_grid_recentered(old_center, action.price)
+                # Re-sync to place new orders
+                new_actions = sync_grid(action.price, [], running_trades, state)
+                for a in new_actions:
+                    if a.action == "place":
+                        try:
+                            await client.open_limit_order(
+                                side=a.side,
+                                price=a.price,
+                                margin=config.GRID_MARGIN_PER_ORDER,
+                                leverage=config.GRID_LEVERAGE,
+                                takeprofit=a.takeprofit,
+                                stoploss=a.stoploss,
+                            )
+                            risk.record_trade("grid")
+                            notify_grid_order_placed(a.side, a.price, config.GRID_MARGIN_PER_ORDER)
+                            placed += 1
+                        except Exception as e:
+                            notify_error(f"Grid order failed: {a.side} @ {a.price}: {e}")
+
+        elif action.action == "place":
+            if config.BOT_MODE == "dry":
+                logger.info(
+                    "🏜️ DRY RUN — would place %s limit @ %.2f (%s)",
+                    action.side, action.price, action.reason,
+                )
+                placed += 1
+            else:
+                try:
+                    await client.open_limit_order(
+                        side=action.side,
+                        price=action.price,
+                        margin=config.GRID_MARGIN_PER_ORDER,
+                        leverage=config.GRID_LEVERAGE,
+                        takeprofit=action.takeprofit,
+                        stoploss=action.stoploss,
+                    )
+                    risk.record_trade("grid")
+                    notify_grid_order_placed(action.side, action.price, config.GRID_MARGIN_PER_ORDER)
+                    placed += 1
+                except Exception as e:
+                    notify_error(f"Grid order failed: {action.side} @ {action.price}: {e}")
+
+    # Check for filled grid trades and record P&L
+    for trade in running_trades:
+        entry = trade.get("entry_price") or trade.get("price", 0)
+        pnl = trade.get("pl", 0)
+        if pnl != 0:
+            # Only record for grid trades (matched by price proximity to grid levels)
+            grid_levels = calculate_grid_levels(state.center_price) if state.center_price > 0 else []
+            for level in grid_levels:
+                if abs(float(entry) - level.price) < 1.0:
+                    risk.record_pnl(pnl, "grid")
+                    break
+
+    # Save state
+    if state.center_price == 0:
+        state.center_price = price
+    state.save()
+
+    mode = "DRY " if config.BOT_MODE == "dry" else ""
+    return f"{mode}Placed {placed} orders, center: {state.center_price:.2f}"
+
+
 async def print_status(client: LNMClientWrapper, risk: RiskManager):
     """Print current bot and market status."""
     print("\n" + "=" * 60)
@@ -199,9 +318,10 @@ async def print_status(client: LNMClientWrapper, risk: RiskManager):
     status = risk.status()
     print(f"\n📊 Risk Manager:")
     print(f"   Date: {status['date']}")
-    print(f"   Daily P&L: {status['daily_pnl_sats']:+d} sats")
-    print(f"   Trades today: {status['trades_today']}")
-    print(f"   Can trade: {status['can_trade']} ({status['reason']})")
+    print(f"   Daily P&L: {status['daily_pnl_sats']:+d} sats (funding: {status['funding_pnl']:+d}, grid: {status['grid_pnl']:+d})")
+    print(f"   Trades today: {status['trades_today']} (funding: {status['funding_trades']}, grid: {status['grid_trades']})")
+    print(f"   Can trade (funding): {status['can_trade']} ({status['reason']})")
+    print(f"   Can trade (grid): {status['can_trade_grid']} ({status['reason_grid']})")
     print(f"   Kill switch: {'🛑 ACTIVE' if status['killed'] else '✅ OFF'}")
 
     # Funding data
@@ -233,6 +353,27 @@ async def print_status(client: LNMClientWrapper, risk: RiskManager):
     except Exception as e:
         print(f"   Error fetching positions: {e}")
 
+    # Grid
+    if config.GRID_ENABLED:
+        print(f"\n📐 Grid Bot:")
+        grid_state = GridState.load()
+        if grid_state.center_price > 0:
+            print(f"   Center price: {grid_state.center_price:.2f}")
+            levels = calculate_grid_levels(grid_state.center_price)
+            buy_levels = sorted([l for l in levels if l.side == "buy"], key=lambda l: l.price, reverse=True)
+            sell_levels = sorted([l for l in levels if l.side == "sell"], key=lambda l: l.price)
+            print(f"   Buy levels: {', '.join(f'{l.price:.2f}' for l in buy_levels)}")
+            print(f"   Sell levels: {', '.join(f'{l.price:.2f}' for l in sell_levels)}")
+        else:
+            print("   Not initialized (will set up on first cycle)")
+        try:
+            open_orders = await client.get_open_orders()
+            print(f"   Open limit orders: {len(open_orders)}")
+        except Exception as e:
+            print(f"   Error fetching open orders: {e}")
+    else:
+        print(f"\n📐 Grid Bot: DISABLED")
+
     # Config
     print(f"\n⚙️  Config:")
     print(f"   Mode: {config.BOT_MODE.upper()}")
@@ -243,6 +384,12 @@ async def print_status(client: LNMClientWrapper, risk: RiskManager):
     print(f"   Max positions: {config.MAX_OPEN_POSITIONS}")
     print(f"   Daily loss limit: {config.DAILY_LOSS_LIMIT_SATS} sats")
     print(f"   Check interval: {config.CHECK_INTERVAL_SECONDS}s")
+    if config.GRID_ENABLED:
+        print(f"   Grid levels: {config.GRID_LEVELS} per side")
+        print(f"   Grid spacing: {config.GRID_SPACING_PCT}%")
+        print(f"   Grid margin/order: {config.GRID_MARGIN_PER_ORDER} sats")
+        print(f"   Grid leverage: {config.GRID_LEVERAGE}x")
+        print(f"   Grid daily limit: {config.GRID_DAILY_LOSS_LIMIT_SATS} sats")
 
     print("\n" + "=" * 60)
 

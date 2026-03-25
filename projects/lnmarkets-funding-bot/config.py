@@ -19,6 +19,9 @@ LNM_NETWORK = os.getenv("LNM_NETWORK", "testnet4")
 # "live" = real trading
 BOT_MODE = os.getenv("BOT_MODE", "dry")
 
+# Enable/disable funding rate strategy
+FUNDING_ENABLED = os.getenv("FUNDING_ENABLED", "false").lower() == "true"
+
 # === Strategy Parameters ===
 
 # Minimum absolute funding rate to trigger a position (in %)
@@ -50,8 +53,31 @@ TAKE_PROFIT_PCT = 1.5
 # Maximum number of open positions at once
 MAX_OPEN_POSITIONS = 3
 
-# Daily loss limit in sats — bot shuts down if exceeded
-DAILY_LOSS_LIMIT_SATS = 50_000
+# Daily loss limit in sats for funding strategy
+DAILY_LOSS_LIMIT_SATS = 25_000
+
+# === Grid Bot ===
+
+# Enable/disable grid trading layer
+GRID_ENABLED = os.getenv("GRID_ENABLED", "true").lower() == "true"
+
+# Number of grid levels on each side of current price (total orders = 2x this)
+GRID_LEVELS = int(os.getenv("GRID_LEVELS", "2"))
+
+# Spacing between grid levels as % of price
+GRID_SPACING_PCT = float(os.getenv("GRID_SPACING_PCT", "0.5"))
+
+# Margin per grid order in sats
+GRID_MARGIN_PER_ORDER = int(os.getenv("GRID_MARGIN_PER_ORDER", "1000"))
+
+# Leverage for grid orders
+GRID_LEVERAGE = int(os.getenv("GRID_LEVERAGE", "2"))
+
+# Daily loss limit for grid strategy (sats)
+GRID_DAILY_LOSS_LIMIT_SATS = int(os.getenv("GRID_DAILY_LOSS_LIMIT_SATS", "5000"))
+
+# Recenter grid if price moves beyond outermost level
+GRID_RECENTER = True
 
 # === Timing ===
 

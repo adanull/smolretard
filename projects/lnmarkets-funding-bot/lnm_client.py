@@ -10,6 +10,8 @@ from typing import Optional
 from lnmarkets_sdk.v3.http.client import APIAuthContext, APIClientConfig, LNMClient
 from lnmarkets_sdk.v3.models.futures_data import GetFundingSettlementsParams
 from lnmarkets_sdk.v3.models.futures_isolated import (
+    CancelTradeParams,
+    FuturesOrder,
     GetClosedTradesParams,
     GetIsolatedFundingFeesParams,
 )
@@ -114,7 +116,7 @@ class LNMClientWrapper:
         takeprofit: Optional[float] = None,
     ) -> dict:
         """
-        Open a new isolated futures trade.
+        Open a new isolated futures trade (market order).
 
         Args:
             side: "buy" (long) or "sell" (short)
@@ -123,8 +125,6 @@ class LNMClientWrapper:
             stoploss: stop-loss price (optional)
             takeprofit: take-profit price (optional)
         """
-        from lnmarkets_sdk.v3.models.futures_isolated import NewTradeMarket
-
         params_dict = {
             "type": "market",
             "side": side,
@@ -136,10 +136,65 @@ class LNMClientWrapper:
         if takeprofit is not None:
             params_dict["takeprofit"] = takeprofit
 
-        params = NewTradeMarket(**params_dict)
+        params = FuturesOrder(**params_dict)
         result = await self._client.futures.isolated.new_trade(params)
         await self._sleep()
         return result.model_dump() if hasattr(result, "model_dump") else result
+
+    async def open_limit_order(
+        self,
+        side: str,
+        price: float,
+        margin: int,
+        leverage: int,
+        stoploss: Optional[float] = None,
+        takeprofit: Optional[float] = None,
+    ) -> dict:
+        """
+        Place a limit order on isolated futures.
+
+        Args:
+            side: "buy" or "sell"
+            price: limit price
+            margin: margin in sats
+            leverage: leverage multiplier
+            stoploss: stop-loss price (optional)
+            takeprofit: take-profit price (optional)
+        """
+        params_dict = {
+            "type": "limit",
+            "side": side,
+            "price": price,
+            "margin": margin,
+            "leverage": leverage,
+        }
+        if stoploss is not None:
+            params_dict["stoploss"] = stoploss
+        if takeprofit is not None:
+            params_dict["takeprofit"] = takeprofit
+
+        params = FuturesOrder(**params_dict)
+        result = await self._client.futures.isolated.new_trade(params)
+        await self._sleep()
+        return result.model_dump() if hasattr(result, "model_dump") else result
+
+    async def get_open_orders(self) -> list[dict]:
+        """Get unfilled limit orders."""
+        result = await self._client.futures.isolated.get_open_trades()
+        await self._sleep()
+        return [t.model_dump() if hasattr(t, "model_dump") else t for t in result]
+
+    async def cancel_order(self, trade_id: str) -> dict:
+        """Cancel an unfilled limit order."""
+        params = CancelTradeParams(id=trade_id)
+        result = await self._client.futures.isolated.cancel(params)
+        await self._sleep()
+        return result.model_dump() if hasattr(result, "model_dump") else result
+
+    async def cancel_all_orders(self) -> None:
+        """Cancel all unfilled limit orders."""
+        await self._client.futures.isolated.cancel_all()
+        await self._sleep()
 
     async def close_trade(self, trade_id: str) -> dict:
         """Close a specific isolated trade by ID."""

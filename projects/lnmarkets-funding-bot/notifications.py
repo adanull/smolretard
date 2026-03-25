@@ -65,3 +65,28 @@ def notify_kill_switch(reason: str):
     msg = f"🛑 KILL SWITCH: {reason}"
     logger.critical(msg)
     print(msg)
+
+
+def notify_grid_order_placed(side: str, price: float, margin: int):
+    """Log a grid limit order placement."""
+    msg = (
+        f"📐 GRID ORDER PLACED\n"
+        f"Side: {side.upper()}\n"
+        f"Price: {price:.2f}\n"
+        f"Margin: {margin} sats\n"
+        f"Time: {datetime.now(timezone.utc).isoformat()}"
+    )
+    logger.info(msg)
+    print(msg)
+
+
+def notify_grid_recentered(old_center: float, new_center: float):
+    """Log grid recenter event."""
+    msg = (
+        f"📐 GRID RECENTERED\n"
+        f"Old center: {old_center:.2f}\n"
+        f"New center: {new_center:.2f}\n"
+        f"Time: {datetime.now(timezone.utc).isoformat()}"
+    )
+    logger.info(msg)
+    print(msg)
