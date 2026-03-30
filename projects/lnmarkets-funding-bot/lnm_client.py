@@ -1,111 +1,131 @@
 """
-LN Markets API client wrapper using the official SDK v3.
-Handles connection management and provides a clean interface.
+LN Markets API client wrapper using the official ln-markets Python SDK.
+Handles connection management and provides a clean async interface.
+
+The SDK is synchronous (requests-based), so we wrap calls with
+asyncio.to_thread to keep the bot's async architecture.
 """
 
 import asyncio
+import json
 import logging
 from typing import Optional
 
-from lnmarkets_sdk.v3.http.client import APIAuthContext, APIClientConfig, LNMClient
-from lnmarkets_sdk.v3.models.futures_data import GetFundingSettlementsParams
-from lnmarkets_sdk.v3.models.futures_isolated import (
-    CancelTradeParams,
-    FuturesOrder,
-    GetClosedTradesParams,
-    GetIsolatedFundingFeesParams,
-)
+from lnmarkets import rest
 
 import config
 
 logger = logging.getLogger(__name__)
 
 
-def _build_config() -> APIClientConfig:
-    """Build API client config from environment."""
-    auth = None
-    if config.LNM_API_KEY and config.LNM_API_SECRET and config.LNM_API_PASSPHRASE:
-        auth = APIAuthContext(
-            key=config.LNM_API_KEY,
-            secret=config.LNM_API_SECRET,
-            passphrase=config.LNM_API_PASSPHRASE,
-        )
-    return APIClientConfig(
-        authentication=auth,
-        network=config.LNM_NETWORK,
-        timeout=30.0,
-    )
+def _parse(response: str) -> dict | list:
+    """Parse JSON response string from the SDK."""
+    try:
+        return json.loads(response)
+    except (json.JSONDecodeError, TypeError):
+        return response
 
 
 class LNMClientWrapper:
-    """Manages the LN Markets client lifecycle and provides trading methods."""
+    """Manages the LN Markets client and provides trading methods."""
 
     def __init__(self):
-        self._config = _build_config()
-        self._client: Optional[LNMClient] = None
+        self._client: Optional[rest.LNMarketsRest] = None
 
     async def connect(self):
-        """Open the client connection."""
-        self._client = LNMClient(self._config)
-        await self._client.__aenter__()
+        """Initialize the REST client."""
+        options = {
+            "key": config.LNM_API_KEY,
+            "secret": config.LNM_API_SECRET,
+            "passphrase": config.LNM_API_PASSPHRASE,
+            "network": config.LNM_NETWORK,
+        }
+        self._client = rest.LNMarketsRest(**options)
         logger.info("Connected to LN Markets (%s)", config.LNM_NETWORK)
 
     async def disconnect(self):
-        """Close the client connection."""
-        if self._client:
-            await self._client.__aexit__(None, None, None)
-            self._client = None
-            logger.info("Disconnected from LN Markets")
+        """Clean up (no persistent connection to close with REST)."""
+        self._client = None
+        logger.info("Disconnected from LN Markets")
 
-    async def _sleep(self):
-        """Respect rate limit: 1 req/sec."""
-        await asyncio.sleep(1.1)
+    async def _call(self, method, *args, **kwargs):
+        """Run a synchronous SDK call in a thread and respect rate limit."""
+        result = await asyncio.to_thread(method, *args, **kwargs)
+        await asyncio.sleep(1.1)  # Rate limit: 1 req/sec
+        return _parse(result)
 
     # === Public Endpoints ===
 
     async def get_ticker(self) -> dict:
         """Get current futures ticker (price, funding rate, etc.)."""
-        result = await self._client.futures.get_ticker()
-        await self._sleep()
-        return result.model_dump() if hasattr(result, "model_dump") else result
+        return await self._call(self._client.futures_get_ticker)
 
     async def get_funding_settlements(self, limit: int = 10) -> list[dict]:
-        """Get recent funding settlement history."""
-        params = GetFundingSettlementsParams(limit=limit)
-        result = await self._client.futures.get_funding_settlements(params)
-        await self._sleep()
-        data = result.data if hasattr(result, "data") else result
-        return [s.model_dump() if hasattr(s, "model_dump") else s for s in data]
+        """
+        Get recent funding/carry fee history.
+        Uses the futures carry-fees endpoint which returns funding fee records.
+        """
+        result = await self._call(self._client.futures_carry_fees, {"limit": limit})
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "data" in result:
+            return result["data"]
+        return [result] if result else []
 
     async def get_last_price(self) -> float:
         """Get the current BTC/USD price."""
-        result = await self._client.oracle.get_last_price()
-        await self._sleep()
-        if result and len(result) > 0:
-            price_obj = result[0]
-            return price_obj.last_price if hasattr(price_obj, "last_price") else float(price_obj)
-        raise ValueError("Could not fetch last price")
+        result = await self._call(self._client.get_oracle_last, {})
+        if isinstance(result, dict):
+            return float(result.get("lastPrice", result.get("last_price", 0)))
+        if isinstance(result, list) and len(result) > 0:
+            item = result[0]
+            if isinstance(item, dict):
+                return float(item.get("lastPrice", item.get("last_price", 0)))
+            return float(item)
+        raise ValueError(f"Could not parse last price from: {result}")
 
     # === Account ===
 
     async def get_account(self) -> dict:
         """Get account info (balance, etc.)."""
-        result = await self._client.account.get_account()
-        await self._sleep()
-        return result.model_dump() if hasattr(result, "model_dump") else result
+        return await self._call(self._client.get_user)
 
     async def get_balance(self) -> int:
         """Get account balance in sats."""
         account = await self.get_account()
         return account.get("balance", 0)
 
-    # === Isolated Futures Trading ===
+    # === Futures Trading ===
 
     async def get_running_trades(self) -> list[dict]:
-        """Get all currently running (open) isolated trades."""
-        result = await self._client.futures.isolated.get_running_trades()
-        await self._sleep()
-        return [t.model_dump() if hasattr(t, "model_dump") else t for t in result]
+        """Get all currently running (open) trades."""
+        result = await self._call(self._client.futures_get_trades, {"type": "running"})
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "data" in result:
+            return result["data"]
+        return []
+
+    async def get_open_orders(self) -> list[dict]:
+        """Get unfilled limit orders (open but not yet running)."""
+        result = await self._call(self._client.futures_get_trades, {"type": "open"})
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "data" in result:
+            return result["data"]
+        return []
+
+    async def get_closed_trades(self, limit: int = 20) -> list[dict]:
+        """Get recently closed trades."""
+        result = await self._call(
+            self._client.futures_get_trades,
+            {"type": "closed", "limit": limit},
+        )
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "data" in result:
+            return result["data"]
+        return []
 
     async def open_trade(
         self,
@@ -116,30 +136,34 @@ class LNMClientWrapper:
         takeprofit: Optional[float] = None,
     ) -> dict:
         """
-        Open a new isolated futures trade (market order).
+        Open a new futures trade (market order).
 
         Args:
-            side: "buy" (long) or "sell" (short)
+            side: "b" (long/buy) or "s" (short/sell)
             margin: margin in sats
             leverage: leverage multiplier
             stoploss: stop-loss price (optional)
             takeprofit: take-profit price (optional)
         """
-        params_dict = {
-            "type": "market",
+        # Normalize side to API format
+        if side in ("buy", "long"):
+            side = "b"
+        elif side in ("sell", "short"):
+            side = "s"
+
+        params = {
+            "type": "m",  # market order
             "side": side,
             "margin": margin,
             "leverage": leverage,
         }
         if stoploss is not None:
-            params_dict["stoploss"] = stoploss
+            params["stoploss"] = stoploss
         if takeprofit is not None:
-            params_dict["takeprofit"] = takeprofit
+            params["takeprofit"] = takeprofit
 
-        params = FuturesOrder(**params_dict)
-        result = await self._client.futures.isolated.new_trade(params)
-        await self._sleep()
-        return result.model_dump() if hasattr(result, "model_dump") else result
+        result = await self._call(self._client.futures_new_trade, params)
+        return result
 
     async def open_limit_order(
         self,
@@ -151,90 +175,67 @@ class LNMClientWrapper:
         takeprofit: Optional[float] = None,
     ) -> dict:
         """
-        Place a limit order on isolated futures.
+        Place a limit order on futures.
 
         Args:
-            side: "buy" or "sell"
+            side: "b" (long/buy) or "s" (short/sell)
             price: limit price
             margin: margin in sats
             leverage: leverage multiplier
             stoploss: stop-loss price (optional)
             takeprofit: take-profit price (optional)
         """
-        params_dict = {
-            "type": "limit",
+        if side in ("buy", "long"):
+            side = "b"
+        elif side in ("sell", "short"):
+            side = "s"
+
+        params = {
+            "type": "l",  # limit order
             "side": side,
             "price": price,
             "margin": margin,
             "leverage": leverage,
         }
         if stoploss is not None:
-            params_dict["stoploss"] = stoploss
+            params["stoploss"] = stoploss
         if takeprofit is not None:
-            params_dict["takeprofit"] = takeprofit
+            params["takeprofit"] = takeprofit
 
-        params = FuturesOrder(**params_dict)
-        result = await self._client.futures.isolated.new_trade(params)
-        await self._sleep()
-        return result.model_dump() if hasattr(result, "model_dump") else result
-
-    async def get_open_orders(self) -> list[dict]:
-        """Get unfilled limit orders."""
-        result = await self._client.futures.isolated.get_open_trades()
-        await self._sleep()
-        return [t.model_dump() if hasattr(t, "model_dump") else t for t in result]
+        result = await self._call(self._client.futures_new_trade, params)
+        return result
 
     async def cancel_order(self, trade_id: str) -> dict:
         """Cancel an unfilled limit order."""
-        params = CancelTradeParams(id=trade_id)
-        result = await self._client.futures.isolated.cancel(params)
-        await self._sleep()
-        return result.model_dump() if hasattr(result, "model_dump") else result
+        return await self._call(self._client.futures_cancel, {"id": trade_id})
 
     async def cancel_all_orders(self) -> None:
         """Cancel all unfilled limit orders."""
-        await self._client.futures.isolated.cancel_all()
-        await self._sleep()
+        await self._call(self._client.futures_cancel_all)
 
     async def close_trade(self, trade_id: str) -> dict:
-        """Close a specific isolated trade by ID."""
-        from lnmarkets_sdk.v3.models.futures_isolated import CloseTradeParams
-
-        params = CloseTradeParams(id=trade_id)
-        result = await self._client.futures.isolated.close(params)
-        await self._sleep()
-        return result.model_dump() if hasattr(result, "model_dump") else result
+        """Close a specific trade by ID."""
+        return await self._call(self._client.futures_close, {"id": trade_id})
 
     async def update_stoploss(self, trade_id: str, value: float) -> dict:
         """Update stop-loss for a trade."""
-        from lnmarkets_sdk.v3.models.futures_isolated import UpdateStoplossParams
-
-        params = UpdateStoplossParams(id=trade_id, value=value)
-        result = await self._client.futures.isolated.update_stoploss(params)
-        await self._sleep()
-        return result.model_dump() if hasattr(result, "model_dump") else result
+        return await self._call(
+            self._client.futures_update_trade,
+            {"id": trade_id, "type": "stoploss", "value": value},
+        )
 
     async def update_takeprofit(self, trade_id: str, value: float) -> dict:
         """Update take-profit for a trade."""
-        from lnmarkets_sdk.v3.models.futures_isolated import UpdateTakeprofitParams
-
-        params = UpdateTakeprofitParams(id=trade_id, value=value)
-        result = await self._client.futures.isolated.update_takeprofit(params)
-        await self._sleep()
-        return result.model_dump() if hasattr(result, "model_dump") else result
-
-    async def get_closed_trades(self, limit: int = 20) -> list[dict]:
-        """Get recently closed trades."""
-        params = GetClosedTradesParams(limit=limit)
-        result = await self._client.futures.isolated.get_closed_trades(params)
-        await self._sleep()
-        data = result.data if hasattr(result, "data") else result
-        return [t.model_dump() if hasattr(t, "model_dump") else t for t in data]
+        return await self._call(
+            self._client.futures_update_trade,
+            {"id": trade_id, "type": "takeprofit", "value": value},
+        )
 
     async def get_funding_fees(self, limit: int = 20) -> list[dict]:
-        """Get funding fees paid/received on isolated positions."""
-        params = GetIsolatedFundingFeesParams(limit=limit)
-        result = await self._client.futures.isolated.get_funding_fees(params)
-        await self._sleep()
-        data = result.data if hasattr(result, "data") else result
-        return [f.model_dump() if hasattr(f, "model_dump") else f for f in data]
+        """Get funding/carry fees paid/received on positions."""
+        result = await self._call(self._client.futures_carry_fees, {"limit": limit})
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "data" in result:
+            return result["data"]
+        return []
